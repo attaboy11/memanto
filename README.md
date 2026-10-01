@@ -288,6 +288,19 @@ Recall is powered by an information-theoretic semantic engine that ships in the 
 
 <br>
 
+**Python** — the `memanto` package ships an in-process client; no server to start:
+
+```python
+from memanto import Memanto
+
+memanto = Memanto(agent_id="my-agent")   # creates the agent on first use
+memanto.remember("Alex prefers oat milk.", type="preference")
+memanto.recall("what does Alex drink?")
+memanto.answer("Does Alex drink dairy?")
+```
+
+Reference: [docs.memanto.ai/sdk/python](https://docs.memanto.ai/sdk/python).
+
 **TypeScript / Node.js** — [`@moorcheh-ai/memanto`](sdks/typescript) boots a local Memanto server via `uvx` and exposes an ergonomic client (`remember` / `recall` / `answer`).
 
 **REST API** — start with `memanto serve`. Endpoint reference at [docs.memanto.ai/api](https://docs.memanto.ai/api) and `http://localhost:8000/docs` while running.
