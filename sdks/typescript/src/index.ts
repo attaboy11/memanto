@@ -83,6 +83,11 @@ export interface CreateAgentInput {
   description?: string;
 }
 
+export interface DeleteAgentInput {
+  /** Also permanently delete the agent's memories in Moorcheh. */
+  deleteMemories?: boolean;
+}
+
 export interface DailySummaryInput {
   /** YYYY-MM-DD. Defaults to today. */
   date?: string;
@@ -342,11 +347,17 @@ export class Memanto {
     return (await res.json()) as unknown;
   }
 
-  /** Delete the bound agent and clear any cached session for it. */
-  async deleteAgent() {
+  /**
+   * Delete the bound agent and clear any cached session for it.
+   *
+   * Its memories stay in Moorcheh unless `deleteMemories` is true. If deleting
+   * them fails, the agent is left intact and the call throws.
+   */
+  async deleteAgent(input: DeleteAgentInput = {}) {
+    const query = input.deleteMemories ? "?delete-backup-too=true" : "";
     const result = await this.request(
       "DELETE",
-      `/api/v2/agents/${this.encodedAgentId}`,
+      `/api/v2/agents/${this.encodedAgentId}${query}`,
       undefined,
       { requireSession: false },
     );
