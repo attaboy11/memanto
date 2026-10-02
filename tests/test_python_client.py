@@ -4,7 +4,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from memanto.app.utils.errors import AgentAlreadyExistsError, AgentNotFoundError
+from memanto.app.utils.errors import (
+    AgentAlreadyExistsError,
+    AgentNotFoundError,
+    InvalidSessionTokenError,
+    SessionExpiredError,
+)
 
 
 @pytest.fixture
@@ -134,21 +139,124 @@ def test_resolve_api_key_on_prem_needs_no_key(monkeypatch):
 
 
 def test_resolve_api_key_cloud(monkeypatch):
-    import os
-
     from memanto.app.clients.backend import Backend
+    from memanto.app.config import settings
     from memanto.client import _resolve_api_key
 
     monkeypatch.delenv("MOORCHEH_API_KEY", raising=False)
+    monkeypatch.setattr(settings, "MOORCHEH_API_KEY", "")
     with patch("memanto.cli.config.manager.ConfigManager") as cm:
         cm.return_value.get_backend.return_value = Backend.CLOUD
         cm.return_value.get_api_key.return_value = None
         with pytest.raises(ValueError, match="No Moorcheh API key"):
             _resolve_api_key(None)
 
-        assert _resolve_api_key("explicit") == "explicit"
-        assert os.environ["MOORCHEH_API_KEY"] == "explicit"
+        monkeypatch.setenv("MOORCHEH_API_KEY", "from-env")
+        assert _resolve_api_key(None) == "from-env"
+        monkeypatch.delenv("MOORCHEH_API_KEY")
 
         cm.return_value.get_api_key.return_value = "saved"
-        monkeypatch.delenv("MOORCHEH_API_KEY")
         assert _resolve_api_key(None) == "saved"
+
+
+def test_explicit_key_does_not_leak_to_other_clients(monkeypatch):
+    """A wrong api_key= on one instance must not become the process-wide key."""
+    import os
+
+    from memanto.app.clients.backend import Backend
+    from memanto.app.config import settings
+    from memanto.client import _resolve_api_key
+
+    monkeypatch.setenv("MOORCHEH_API_KEY", "good")
+    monkeypatch.setattr(settings, "MOORCHEH_API_KEY", "good")
+    with patch("memanto.cli.config.manager.ConfigManager") as cm:
+        cm.return_value.get_backend.return_value = Backend.CLOUD
+        assert _resolve_api_key("wrong") == "wrong"
+        assert os.environ["MOORCHEH_API_KEY"] == "good"
+        assert settings.MOORCHEH_API_KEY == "good"
+        assert _resolve_api_key(None) == "good"
+
+
+def test_explicit_key_fills_unset_global_key(monkeypatch):
+    """With no configured key, the explicit key backs global-key services."""
+    from memanto.app.clients.backend import Backend
+    from memanto.app.config import settings
+    from memanto.client import _resolve_api_key
+
+    monkeypatch.delenv("MOORCHEH_API_KEY", raising=False)
+    monkeypatch.setattr(settings, "MOORCHEH_API_KEY", "")
+    with patch("memanto.cli.config.manager.ConfigManager") as cm:
+        cm.return_value.get_backend.return_value = Backend.CLOUD
+        _resolve_api_key("explicit")
+    assert settings.MOORCHEH_API_KEY == "explicit"
+
+
+def _live_session(token="tok"):
+    session = MagicMock(session_token=token)
+    session.is_active.return_value = True
+    return session
+
+
+def test_unverifiable_live_session_is_replaced(sdk):
+    """A session file whose token no longer verifies (rotated secret) is not adopted."""
+    from memanto import Memanto
+
+    sdk.session_service.get_session.return_value = _live_session("bad")
+    sdk.session_service.validate_session.side_effect = InvalidSessionTokenError("x")
+
+    Memanto("bot")
+
+    sdk.activate_agent.assert_called_once_with("bot", duration_hours=None)
+
+
+@pytest.mark.parametrize("error", [SessionExpiredError, InvalidSessionTokenError])
+def test_lost_session_is_recovered_and_call_retried_once(sdk, error):
+    """Expiry or another client's activation must not break a long-lived instance."""
+    from memanto import Memanto
+
+    m = Memanto("bot")
+    sdk.activate_agent.reset_mock()
+    # Another client activated meanwhile: the session file now holds its token.
+    sdk.session_service.get_session.return_value = _live_session("theirs")
+    sdk.recall.side_effect = [error("lost"), {"memories": []}]
+
+    assert m.recall("q") == {"memories": []}
+    assert sdk.recall.call_count == 2
+    assert sdk.session_token == "theirs"
+    assert sdk._cached_session is None
+    sdk.activate_agent.assert_not_called()
+
+
+def test_persistent_session_error_is_raised_not_looped(sdk):
+    from memanto import Memanto
+
+    m = Memanto("bot")
+    sdk.remember.side_effect = SessionExpiredError("still lost")
+
+    with pytest.raises(SessionExpiredError):
+        m.remember("x")
+    assert sdk.remember.call_count == 2
+
+
+def test_non_session_errors_are_not_retried(sdk):
+    from memanto import Memanto
+
+    m = Memanto("bot")
+    sdk.remember.side_effect = ValueError("bad type")
+
+    with pytest.raises(ValueError):
+        m.remember("x", type="nonsense")
+    assert sdk.remember.call_count == 1
+
+
+def test_single_filter_values_are_wrapped_in_lists(sdk):
+    from memanto import Memanto
+
+    m = Memanto("bot")
+    m.recall("q", type="fact", tags="diet")
+    assert sdk.recall.call_args.kwargs["type"] == ["fact"]
+    assert sdk.recall.call_args.kwargs["tags"] == ["diet"]
+    m.recall_recent(type=["fact", "goal"])
+    assert sdk.recall_recent.call_args.kwargs["type"] == ["fact", "goal"]
+    m.remember("x", tags="diet")
+    assert sdk.remember.call_args.kwargs["tags"] == ["diet"]

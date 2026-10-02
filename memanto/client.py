@@ -21,25 +21,45 @@ operations not wrapped here, use the underlying ``SdkClient`` via
 from __future__ import annotations
 
 import os
-from typing import Any
+from collections.abc import Callable
+from typing import Any, TypeVar
 
-from memanto.app.utils.errors import AgentAlreadyExistsError, AgentNotFoundError
+from memanto.app.utils.errors import (
+    AgentAlreadyExistsError,
+    AgentNotFoundError,
+    InvalidSessionTokenError,
+    SessionExpiredError,
+    SessionNotFoundError,
+)
 from memanto.cli.client.sdk_client import SdkClient
 
 __all__ = ["Memanto"]
 
+_T = TypeVar("_T")
+
 # Placeholder key for the on-prem backend; OnPremClient ignores it.
 _ON_PREM_API_KEY = "on-prem"
 
+# Raised when this instance's session lapsed or another client of the same
+# agent replaced it. SdkClient checks the session before any side effect, so
+# re-establishing the session and retrying once cannot duplicate a write.
+_SESSION_ERRORS = (SessionExpiredError, InvalidSessionTokenError, SessionNotFoundError)
+
+
+def _as_list(value: str | list[str] | None) -> list[str] | None:
+    """Accept a single filter value as well as a list (``type="fact"``)."""
+    return [value] if isinstance(value, str) else value
+
 
 def _resolve_api_key(api_key: str | None) -> str:
-    """Return the key to use: explicit arg, then env/``~/.memanto/.env``.
+    """Return the key to use: explicit arg, then ``MOORCHEH_API_KEY``.
 
-    The on-prem backend needs no key. On the cloud path the key is also
-    exported as ``MOORCHEH_API_KEY`` because the app services read it from
-    the environment (same as the CLI's ``get_client``).
+    Importing ``memanto.app.config`` loads ``~/.memanto/.env`` over the
+    environment, so a key saved by ``memanto`` setup takes precedence over an
+    exported ``MOORCHEH_API_KEY``. The on-prem backend needs no key.
     """
     from memanto.app.clients.backend import Backend
+    from memanto.app.config import settings
     from memanto.cli.config.manager import ConfigManager
 
     config = ConfigManager()
@@ -52,7 +72,11 @@ def _resolve_api_key(api_key: str | None) -> str:
             "No Moorcheh API key found. Pass api_key=..., set MOORCHEH_API_KEY, "
             "or run `memanto` once to configure a backend."
         )
-    os.environ["MOORCHEH_API_KEY"] = key
+    # Services that fall back to the global key (daily analysis) need one. Fill
+    # it only when none is configured: never replace the key that other
+    # clients in this process resolve.
+    if not settings.MOORCHEH_API_KEY:
+        settings.MOORCHEH_API_KEY = key
     return key
 
 
@@ -75,9 +99,11 @@ class Memanto:
             ``False``.
 
     Memanto allows one session per agent: activating a session signs out every
-    other client of that agent. So the constructor reuses the agent's live
-    session when there is one and only activates when there is none. Use one
-    instance per agent; an instance is not thread-safe.
+    other client of that agent. So the client adopts the agent's live session
+    when there is one and only activates when there is none — at construction,
+    and again whenever its session expires or another client (the CLI, another
+    process) replaces it. Use one instance per agent; an instance is not
+    thread-safe.
     """
 
     def __init__(
@@ -91,8 +117,9 @@ class Memanto:
     ) -> None:
         self.agent_id = agent_id
         self.client = SdkClient(api_key=_resolve_api_key(api_key))
+        self._session_hours = session_hours
         self._ensure_agent(auto_create, pattern)
-        self._ensure_session(session_hours)
+        self._ensure_session()
 
     def _ensure_agent(self, auto_create: bool, pattern: str) -> None:
         try:
@@ -106,15 +133,32 @@ class Memanto:
         except AgentAlreadyExistsError:
             pass  # created concurrently by another client
 
-    def _ensure_session(self, session_hours: int | None) -> None:
+    def _ensure_session(self) -> None:
+        """Adopt the agent's live session if its token verifies, else activate."""
         from memanto.app.services.session_service import get_session_service
 
-        session = get_session_service().get_session(self.agent_id)
+        service = get_session_service()
+        session = service.get_session(self.agent_id)
         if session is not None and session.is_active():
-            self.client.session_token = session.session_token
-            self.client.agent_id = self.agent_id
-        else:
-            self.client.activate_agent(self.agent_id, duration_hours=session_hours)
+            try:
+                service.validate_session(session.session_token)
+            except (SessionExpiredError, InvalidSessionTokenError):
+                pass  # e.g. signed with a rotated secret key; activate below
+            else:
+                self.client.session_token = session.session_token
+                self.client.agent_id = self.agent_id
+                # Drop SdkClient's cached session so it re-validates the new token.
+                self.client._cached_session = None
+                return
+        self.client.activate_agent(self.agent_id, duration_hours=self._session_hours)
+
+    def _call(self, fn: Callable[..., _T], *args: Any, **kwargs: Any) -> _T:
+        """Run an SdkClient call, recovering once from a lost session."""
+        try:
+            return fn(self.agent_id, *args, **kwargs)
+        except _SESSION_ERRORS:
+            self._ensure_session()
+            return fn(self.agent_id, *args, **kwargs)
 
     # Write
 
@@ -125,7 +169,7 @@ class Memanto:
         type: str | None = None,
         title: str | None = None,
         confidence: float = 0.8,
-        tags: list[str] | None = None,
+        tags: str | list[str] | None = None,
         source: str = "user",
         provenance: str | None = None,
     ) -> dict[str, Any]:
@@ -135,13 +179,13 @@ class Memanto:
         """
         if title is None:
             title = f"{content[:50]}..." if len(content) > 50 else content
-        return self.client.remember(
-            self.agent_id,
+        return self._call(
+            self.client.remember,
             memory_type=type,
             title=title,
             content=content,
             confidence=confidence,
-            tags=tags,
+            tags=_as_list(tags),
             source=source,
             provenance=provenance,
         )
@@ -149,37 +193,39 @@ class Memanto:
     def batch_remember(self, memories: list[dict[str, Any]]) -> dict[str, Any]:
         """Store up to 100 memories. Each item takes the same keys as
         :meth:`remember` (``content`` required)."""
-        return self.client.batch_remember(self.agent_id, memories)
+        return self._call(self.client.batch_remember, memories)
 
     def update_memory(self, memory_id: str, **updates: Any) -> dict[str, Any]:
         """Update fields of a memory, e.g. ``content=...`` or ``tags=[...]``."""
-        return self.client.update_memory(self.agent_id, memory_id, updates)
+        return self._call(self.client.update_memory, memory_id, updates)
 
     def delete_memory(self, memory_id: str) -> dict[str, Any]:
         """Delete a memory by id."""
-        return self.client.delete_memory(self.agent_id, memory_id)
+        return self._call(self.client.delete_memory, memory_id)
 
     # Read
+    #
+    # ``type`` and ``tags`` filters take one value or a list of values.
 
     def recall(
         self,
         query: str,
         *,
         limit: int | None = None,
-        type: list[str] | None = None,
-        tags: list[str] | None = None,
+        type: str | list[str] | None = None,
+        tags: str | list[str] | None = None,
         min_similarity: float | None = None,
     ) -> dict[str, Any]:
         """Semantic search over this agent's memories.
 
         Returns a dict whose ``memories`` list is ranked by relevance.
         """
-        return self.client.recall(
-            self.agent_id,
+        return self._call(
+            self.client.recall,
             query,
             limit=limit,
-            type=type,
-            tags=tags,
+            type=_as_list(type),
+            tags=_as_list(tags),
             min_similarity=min_similarity,
         )
 
@@ -188,12 +234,16 @@ class Memanto:
         as_of: str,
         *,
         limit: int | None = None,
-        type: list[str] | None = None,
-        tags: list[str] | None = None,
+        type: str | list[str] | None = None,
+        tags: str | list[str] | None = None,
     ) -> dict[str, Any]:
         """What the agent believed at *as_of* (ISO date or datetime)."""
-        return self.client.recall_as_of(
-            self.agent_id, as_of, limit=limit, type=type, tags=tags
+        return self._call(
+            self.client.recall_as_of,
+            as_of,
+            limit=limit,
+            type=_as_list(type),
+            tags=_as_list(tags),
         )
 
     def recall_changed_since(
@@ -201,24 +251,31 @@ class Memanto:
         since: str,
         *,
         limit: int | None = None,
-        type: list[str] | None = None,
-        tags: list[str] | None = None,
+        type: str | list[str] | None = None,
+        tags: str | list[str] | None = None,
     ) -> dict[str, Any]:
         """Memories created or updated after *since* (ISO date or datetime)."""
-        return self.client.recall_changed_since(
-            self.agent_id, since, limit=limit, type=type, tags=tags
+        return self._call(
+            self.client.recall_changed_since,
+            since,
+            limit=limit,
+            type=_as_list(type),
+            tags=_as_list(tags),
         )
 
     def recall_recent(
         self,
         *,
         limit: int | None = None,
-        type: list[str] | None = None,
-        tags: list[str] | None = None,
+        type: str | list[str] | None = None,
+        tags: str | list[str] | None = None,
     ) -> dict[str, Any]:
         """Most recently created memories, newest first."""
-        return self.client.recall_recent(
-            self.agent_id, limit=limit, type=type, tags=tags
+        return self._call(
+            self.client.recall_recent,
+            limit=limit,
+            type=_as_list(type),
+            tags=_as_list(tags),
         )
 
     def answer(
@@ -235,8 +292,8 @@ class Memanto:
 
         Returns a dict with ``answer`` and the supporting memories.
         """
-        return self.client.answer(
-            self.agent_id,
+        return self._call(
+            self.client.answer,
             question,
             limit=limit,
             threshold=threshold,

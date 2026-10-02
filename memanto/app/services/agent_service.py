@@ -99,7 +99,7 @@ class AgentService:
 
             try:
                 client.namespaces.create(namespace, type="text")
-                print(f"[OK] Namespace created in Moorcheh: {namespace}")
+                logger.info("Namespace created in Moorcheh: %s", namespace)
             except Exception as exc:
                 message = str(exc).lower()
                 if "limit" in message or "tier" in message or "quota" in message:
@@ -107,7 +107,7 @@ class AgentService:
                 if isinstance(exc, ConflictError) or (
                     "namespace" in message and "already exists" in message
                 ):
-                    print(f"[OK] Namespace already exists in Moorcheh: {namespace}")
+                    logger.info("Namespace already exists in Moorcheh: %s", namespace)
                 else:
                     raise NamespaceError(
                         f"Failed to create namespace '{namespace}' in Moorcheh: {exc}"
