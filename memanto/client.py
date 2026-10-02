@@ -203,6 +203,16 @@ class Memanto:
         """Delete a memory by id."""
         return self._call(self.client.delete_memory, memory_id)
 
+    def delete_agent(self, *, delete_memories: bool = False) -> dict[str, Any]:
+        """Delete this agent; the instance cannot be used afterwards.
+
+        By default the agent's memories stay in Moorcheh and come back if an
+        agent with the same id is created again. Pass ``delete_memories=True``
+        to delete them permanently as well. If that fails, the agent is left
+        intact and ``NamespaceError`` is raised, so the call can be retried.
+        """
+        return self.client.delete_agent(self.agent_id, delete_memories=delete_memories)
+
     # Read
     #
     # ``type`` and ``tags`` filters take one value or a list of values.

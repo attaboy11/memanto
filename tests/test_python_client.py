@@ -260,3 +260,12 @@ def test_single_filter_values_are_wrapped_in_lists(sdk):
     assert sdk.recall_recent.call_args.kwargs["type"] == ["fact", "goal"]
     m.remember("x", tags="diet")
     assert sdk.remember.call_args.kwargs["tags"] == ["diet"]
+
+
+@pytest.mark.parametrize("delete_memories", [False, True])
+def test_delete_agent_passes_memory_choice(sdk, delete_memories):
+    from memanto import Memanto
+
+    m = Memanto("bot")
+    m.delete_agent(delete_memories=delete_memories)
+    sdk.delete_agent.assert_called_once_with("bot", delete_memories=delete_memories)

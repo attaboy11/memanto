@@ -126,7 +126,7 @@ session token.
 - `listAgents()`
 - `getAgent()`
 - `createAgent({ pattern?, description? })` — explicit create (only needed when `autoCreate: false`).
-- `deleteAgent()`
+- `deleteAgent({ deleteMemories? })` — memories are kept in Moorcheh unless `deleteMemories: true`
 - `deactivate()` — end the current session (the next call rebootstraps).
 - `status()` — current session info.
 - `close()` — stop the spawned server.

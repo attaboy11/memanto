@@ -88,7 +88,7 @@ function startFakeApi(
         if (url === "/api/v2/agents" && req.method === "POST")
           return reply(201, { agent_id: agentId });
         if (
-          url === `/api/v2/agents/${encodedAgentId}` &&
+          url.split("?")[0] === `/api/v2/agents/${encodedAgentId}` &&
           req.method === "DELETE"
         )
           return reply(200, { agent_id: agentId, deleted: true });
@@ -334,6 +334,26 @@ describe("Memanto", () => {
       "POST /api/v2/agents",
       "POST /api/v2/agents/test-agent/activate",
       "POST /api/v2/agents/test-agent/remember",
+    ]);
+  });
+
+  it("deletes cloud memories only when asked", async () => {
+    const api = await startFakeApi();
+    cleanupFns.push(api.close);
+
+    const m = new Memanto({ agentId: "test-agent", baseUrl: api.url });
+    cleanupFns.push(() => m.close());
+
+    await m.deleteAgent();
+    await m.deleteAgent({ deleteMemories: true });
+
+    expect(
+      api.recorded
+        .filter((r) => r.method === "DELETE")
+        .map((r) => r.url),
+    ).toEqual([
+      "/api/v2/agents/test-agent",
+      "/api/v2/agents/test-agent?delete-backup-too=true",
     ]);
   });
 
