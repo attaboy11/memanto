@@ -151,7 +151,7 @@ class SdkClient:
         if self._agent_service is None:
             from memanto.app.services.agent_service import AgentService
 
-            self._agent_service = AgentService()
+            self._agent_service = AgentService(client=self._get_moorcheh())
         return self._agent_service
 
     def _get_session_service(self):
@@ -169,7 +169,9 @@ class SdkClient:
                 DailyAnalysisService,
             )
 
-            self._daily_analysis_service = DailyAnalysisService()
+            self._daily_analysis_service = DailyAnalysisService(
+                client=self._get_moorcheh()
+            )
         return self._daily_analysis_service
 
     def _get_export_service(self):
