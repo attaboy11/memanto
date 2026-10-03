@@ -24,6 +24,23 @@ def _make_app():
     return app
 
 
+class _LoopbackClient:
+    """ASGI wrapper that makes TestClient requests look like loopback traffic."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            scope = dict(scope)
+            scope["client"] = ("127.0.0.1", 50000)
+        await self.app(scope, receive, send)
+
+
+def _make_loopback_client(app):
+    return TestClient(_LoopbackClient(app), raise_server_exceptions=False)
+
+
 class TestUnauthenticatedUIEndpoints:
     """Unauthenticated requests from non-localhost must be refused with HTTP 403.
 
@@ -63,6 +80,30 @@ class TestUnauthenticatedUIEndpoints:
         client = TestClient(app, raise_server_exceptions=False)
         resp = client.put("/api/ui/api-key", json={"api_key": "stolen"})
         assert resp.status_code == 403, f"expected 403, got {resp.status_code}"
+
+    def test_loopback_cross_site_origin_rejected(self):
+        """Local browser requests from another website must not reach UI endpoints."""
+        app = _make_app()
+        client = _make_loopback_client(app)
+        resp = client.post(
+            "/api/ui/shutdown",
+            headers={"Origin": "https://evil.example"},
+        )
+        assert resp.status_code == 403, f"expected 403, got {resp.status_code}"
+        assert resp.json()["detail"] == ("Origin not allowed for management endpoints")
+
+    def test_loopback_cross_site_fetch_metadata_rejected(self):
+        """Fetch Metadata blocks no-cors style cross-site POSTs without Origin."""
+        app = _make_app()
+        client = _make_loopback_client(app)
+        resp = client.post(
+            "/api/ui/shutdown",
+            headers={"Sec-Fetch-Site": "cross-site"},
+        )
+        assert resp.status_code == 403, f"expected 403, got {resp.status_code}"
+        assert resp.json()["detail"] == (
+            "UI management endpoints reject cross-site browser requests."
+        )
 
 
 class TestLoopbackDetection:
@@ -104,12 +145,26 @@ class TestLoopbackDetection:
 
         assert _is_loopback("testclient") is False
 
+    def test_loopback_origin_accepted(self):
+        """Same-origin UI requests from localhost must be allowed."""
+        from memanto.app.routes.auth_deps import _is_loopback_origin
+
+        assert _is_loopback_origin("http://localhost:8000") is True
+        assert _is_loopback_origin("http://127.0.0.1:8000") is True
+        assert _is_loopback_origin("http://[::1]:8000") is True
+
+    def test_remote_origin_rejected(self):
+        from memanto.app.routes.auth_deps import _is_loopback_origin
+
+        assert _is_loopback_origin("https://evil.example") is False
+
     def test_require_local_allows_loopback(self):
         """_require_local must not raise for a 127.0.0.1 caller."""
         from memanto.app.ui.routes.ui_router import _require_local
 
         mock_request = MagicMock()
         mock_request.client.host = "127.0.0.1"
+        mock_request.headers = {"host": "localhost:8000"}
         asyncio.run(_require_local(mock_request))  # must not raise
 
     def test_require_local_allows_ipv4_mapped_loopback(self):
@@ -118,4 +173,85 @@ class TestLoopbackDetection:
 
         mock_request = MagicMock()
         mock_request.client.host = "::ffff:127.0.0.1"
+        mock_request.headers = {"host": "localhost:8000"}
         asyncio.run(_require_local(mock_request))  # must not raise
+
+    def test_require_local_rejects_forwarded_non_loopback(self):
+        """Requests from loopback but with remote X-Forwarded-For must be rejected."""
+        import pytest
+        from fastapi import HTTPException
+
+        from memanto.app.ui.routes.ui_router import _require_local
+
+        # X-Forwarded-For with external IP
+        mock_request = MagicMock()
+        mock_request.client.host = "127.0.0.1"
+        mock_request.headers = {"x-forwarded-for": "203.0.113.195", "host": "127.0.0.1"}
+        with pytest.raises(HTTPException) as exc_info:
+            asyncio.run(_require_local(mock_request))
+        assert exc_info.value.status_code == 403
+
+        # X-Real-IP with external IP
+        mock_request.headers = {"x-real-ip": "198.51.100.2", "host": "127.0.0.1"}
+        with pytest.raises(HTTPException) as exc_info:
+            asyncio.run(_require_local(mock_request))
+        assert exc_info.value.status_code == 403
+
+        # Forwarded header with external IP
+        mock_request.headers = {
+            "forwarded": "for=203.0.113.195;proto=http",
+            "host": "127.0.0.1",
+        }
+        with pytest.raises(HTTPException) as exc_info:
+            asyncio.run(_require_local(mock_request))
+        assert exc_info.value.status_code == 403
+
+        # Internal loopback proxy chain is allowed
+        mock_request.headers = {
+            "x-forwarded-for": "127.0.0.1, ::1",
+            "host": "127.0.0.1",
+        }
+        asyncio.run(_require_local(mock_request))  # must not raise
+
+    def test_require_management_access_rejects_forwarded_non_loopback(self):
+        """require_management_access must refuse loopback trust when forwarded from remote."""
+        import pytest
+        from fastapi import HTTPException
+
+        from memanto.app.routes.auth_deps import require_management_access
+
+        mock_request = MagicMock()
+        mock_request.client.host = "127.0.0.1"
+        mock_request.headers = {
+            "host": "localhost:8000",
+            "x-forwarded-for": "203.0.113.195",
+        }
+        with pytest.raises(HTTPException) as exc_info:
+            require_management_access(mock_request)
+        assert exc_info.value.status_code == 401
+
+    def test_has_forwarded_non_loopback_variants(self):
+        """Test _has_forwarded_non_loopback across various header permutations."""
+        from memanto.app.routes.auth_deps import _has_forwarded_non_loopback
+
+        req = MagicMock()
+        req.headers = {}
+        assert _has_forwarded_non_loopback(req) is False
+
+        req.headers = {"x-forwarded-for": "127.0.0.1"}
+        assert _has_forwarded_non_loopback(req) is False
+
+        req.headers = {"x-forwarded-for": "127.0.0.1, 192.168.1.50"}
+        assert _has_forwarded_non_loopback(req) is True
+
+        req.headers = {"x-real-ip": "10.0.0.5"}
+        assert _has_forwarded_non_loopback(req) is True
+
+        req.headers = {"x-real-ip": "::1"}
+        assert _has_forwarded_non_loopback(req) is False
+
+        req.headers = {"forwarded": 'for="[::1]"'}
+        assert _has_forwarded_non_loopback(req) is False
+
+        req.headers = {"forwarded": "for=198.51.100.1:443;proto=https"}
+        assert _has_forwarded_non_loopback(req) is True

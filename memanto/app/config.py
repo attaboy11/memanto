@@ -5,6 +5,7 @@ Server-side settings (loaded from .env via pydantic-settings).
 CLI config models have been moved to cli/config/manager.py.
 """
 
+import ipaddress
 import logging
 import os
 from pathlib import Path
@@ -56,6 +57,21 @@ if _config_file.exists():
             if _smart_parse is not None:
                 os.environ["AUTO_PARSE_ENABLED"] = str(_smart_parse)
 
+            # Session toggles. The Web UI and ``memanto config`` persist these
+            # to config.yaml, but SessionService reads them off ``settings``,
+            # so without this they would be inert for the server and only
+            # half-honoured by the CLI. Use setdefault so an explicitly
+            # exported SESSION_AUTO_* (containerised deployments) still wins.
+            _session = _memanto.get("session", {})
+            if isinstance(_session, dict):
+                for _yaml_key, _env_key in (
+                    ("auto_renew_enabled", "SESSION_AUTO_RENEW_ENABLED"),
+                    ("auto_recreate_enabled", "SESSION_AUTO_RECREATE_ENABLED"),
+                ):
+                    _toggle = _session.get(_yaml_key)
+                    if isinstance(_toggle, bool):
+                        os.environ.setdefault(_env_key, str(_toggle))
+
             # Backend selection (cloud | on-prem)
             _backend = _memanto.get("backend")
             if _backend:
@@ -99,6 +115,7 @@ class SessionConfig(BaseModel):
     warn_before_expiry_minutes: int = 15
     auto_renew_enabled: bool = True
     auto_renew_interval_hours: int = 6
+    auto_recreate_enabled: bool = True
 
 
 class CLIConfig(BaseModel):
@@ -111,9 +128,9 @@ class CLIConfig(BaseModel):
 
 
 class Settings(BaseSettings):
+    # Moorcheh Configuration
     """Unified Settings: sourced from environment / .env files"""
 
-    # Moorcheh Configuration
     MOORCHEH_API_KEY: str = ""
 
     # Backend selection: "cloud" (default) or "on-prem".
@@ -122,6 +139,7 @@ class Settings(BaseSettings):
     MOORCHEH_ONPREM_EMBEDDING_PROVIDER: str = ""
     # HTTP read timeout (seconds) for the on-prem MoorchehClient. Default 300
     # so first-call LLM cold-starts on Ollama don't hit the SDK's 30s default.
+
     MOORCHEH_ONPREM_TIMEOUT: int = 300
 
     # Server Configuration
@@ -130,11 +148,14 @@ class Settings(BaseSettings):
     DEBUG: bool = False
 
     # CORS Configuration
-    ALLOWED_ORIGINS: list[str] = ["*"]
     # Setting allow_credentials=True with a wildcard origin causes Starlette to
     # reflect any request Origin back, allowing any site to make credentialed
     # cross-origin requests.  Default to False; set to True only when ALLOWED_ORIGINS
     # lists explicit trusted domains (never with "*").
+    ALLOWED_ORIGINS: list[str] = []
+
+    CORS_ORIGIN_REGEX: str | None = r"^http://(localhost|127\.0\.0\.1)(:[0-9]+)?$"
+
     CORS_ALLOW_CREDENTIALS: bool = False
 
     # Session Configuration
@@ -144,6 +165,10 @@ class Settings(BaseSettings):
     SESSION_EXTEND_THRESHOLD_MINUTES: int = 30
     SESSION_AUTO_RENEW_ENABLED: bool = True
     SESSION_AUTO_RENEW_INTERVAL_HOURS: int = 6
+    # Transparently issue a fresh session (new token) when a request presents
+    # an expired-but-not-terminated token. Gated behind management access.
+
+    SESSION_AUTO_RECREATE_ENABLED: bool = True
 
     # Memory Configuration
     DEFAULT_TTL_SECONDS: int = 3600  # 1 hour
@@ -169,6 +194,11 @@ class Settings(BaseSettings):
     # UI Mode
     MEMANTO_UI_MODE: bool = False
 
+    MEMANTO_ENABLE_DOCS: bool = False
+
+    MEMANTO_REQUIRE_SECURE: bool = False
+    MEMANTO_PROXY_ALLOWED_IPS: list[str] = []
+
     model_config = SettingsConfigDict(
         env_file=".env", case_sensitive=True, extra="ignore"
     )
@@ -178,8 +208,28 @@ class Settings(BaseSettings):
 settings = Settings()
 
 
+def is_loopback_host(host: str | None) -> bool:
+    raw = (host or "").strip().lower().strip("[]")
+    if raw == "localhost":
+        return True
+    if not raw:
+        return False
+    try:
+        addr = ipaddress.ip_address(raw)
+    except ValueError:
+        return False
+    if addr.is_loopback:
+        return True
+
+    if isinstance(addr, ipaddress.IPv6Address):
+        mapped = addr.ipv4_mapped
+        return mapped is not None and mapped.is_loopback
+    return False
+
+
 def get_data_dir() -> Path:
-    """Root data dir for the active backend.
+    """
+    Root data dir for the active backend.
 
     Cloud users keep ``~/.memanto/`` (no migration). On-prem data is
     isolated under ``~/.memanto/on-prem/``.
@@ -190,3 +240,21 @@ def get_data_dir() -> Path:
         d.mkdir(parents=True, exist_ok=True)
         return d
     return base
+
+
+def get_conflicts_dir() -> Path:
+    """Return the shared directory for conflict reports."""
+    d = get_data_dir() / "conflicts"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def get_conflict_report_path(agent_id: str, date: str) -> Path:
+    """Return a safely constructed path for a conflict report, validating components against traversal."""
+    import re
+
+    if not re.match(r"^[\w\-]+$", agent_id):
+        raise ValueError(f"Invalid agent_id format: {agent_id}")
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", date):
+        raise ValueError(f"Invalid date format: {date}")
+    return get_conflicts_dir() / f"{agent_id}_{date}_conflicts.json"

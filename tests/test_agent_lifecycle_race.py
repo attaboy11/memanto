@@ -85,7 +85,11 @@ def test_delete_revokes_session_from_inflight_activation(
         activation_result = activation.result(timeout=3)
         deletion_result = deletion.result(timeout=3)
 
-    assert deletion_result == {"status": "deleted", "agent_id": "race-agent"}
+    assert deletion_result == {
+        "status": "deleted",
+        "agent_id": "race-agent",
+        "memories_deleted": False,
+    }
     assert agent_service.get_agent("race-agent") is None
     assert session_service.get_session("race-agent") is None
     with pytest.raises(InvalidSessionTokenError):
@@ -129,6 +133,7 @@ def test_activation_rechecks_agent_after_concurrent_delete(
         assert deletion.result(timeout=3) == {
             "status": "deleted",
             "agent_id": "race-agent",
+            "memories_deleted": False,
         }
         with pytest.raises(AgentNotFoundError):
             activation.result(timeout=3)

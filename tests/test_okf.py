@@ -1,4 +1,5 @@
-"""OKF (Open Knowledge Format) export/import coverage.
+"""
+OKF (Open Knowledge Format) export/import coverage.
 
 Exercises the three pure building blocks — ``OkfExportService`` (Memanto ->
 OKF bundle), ``load_okf_bundle`` (bundle -> entries), and ``map_okf`` (entries
@@ -8,8 +9,13 @@ foreign OKF bundle whose free-form ``type`` and unknown keys must land in the
 ``[Supporting data]`` footer without loss.
 """
 
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
+from pathlib import Path
+from threading import Event
 from time import perf_counter
 
+import pytest
 import yaml  # type: ignore[import-untyped]
 
 from memanto.app.services.okf_export_service import OkfExportService
@@ -30,9 +36,11 @@ def _mem(mem_id, title, content, **extra):
 
 
 def test_auto_split_layout(tmp_path):
-    """`auto` writes one file per memory for small types and a single stacked
+    """
+    `auto` writes one file per memory for small types and a single stacked
     file once a type exceeds the threshold; memories live under ``memories/``
-    and index files are always written."""
+    and index files are always written.
+    """
     memories_by_type = {
         "fact": [
             _mem("f1", "Postgres is the DB", "Uses PostgreSQL 16."),
@@ -60,13 +68,16 @@ def test_auto_split_layout(tmp_path):
     assert (memories / "event" / "event.md").exists()
     assert not (memories / "event" / "standup-0.md").exists()
     # Aggregate metrics generated from the gathered memories.
+
     assert (base / "metrics" / "overview.md").exists()
 
 
 def test_context_sections_and_import_scope(tmp_path):
-    """Daily-summary and session files are copied into their sections, and
+    """
+    Daily-summary and session files are copied into their sections, and
     import stays scoped to ``memories/`` so those context logs are never
-    re-ingested as memories."""
+    re-ingested as memories.
+    """
     summary = tmp_path / "agent1_2026-07-01.md"
     summary.write_text("# Daily summary\nStuff happened.\n", encoding="utf-8")
     session = tmp_path / "agent1_2026-07-01_s1_summary.md"
@@ -100,8 +111,7 @@ def test_context_sections_and_import_scope(tmp_path):
 
 
 def test_memanto_round_trip_preserves_extras(tmp_path):
-    """Memanto -> OKF -> Memanto keeps type/confidence/source_ref/tags/body via
-    the ``x_memanto`` block, and always marks provenance as imported."""
+    """Memanto -> OKF -> Memanto keeps schema fields and metadata via ``x_memanto``."""
     memories_by_type = {
         "fact": [
             _mem(
@@ -114,6 +124,9 @@ def test_memanto_round_trip_preserves_extras(tmp_path):
                 source="user",
                 status="active",
                 created_at="2026-05-28T14:30:00Z",
+                updated_at="2026-06-01T09:15:00Z",
+                expires_at="2026-08-01T09:15:00Z",
+                ttl_seconds=5_529_600,
                 source_ref="https://example.com/db",
             )
         ],
@@ -130,17 +143,59 @@ def test_memanto_round_trip_preserves_extras(tmp_path):
     assert pg["type"] == "fact"  # x_memanto.type round-trips
     assert pg["confidence"] == 0.9  # x_memanto.confidence round-trips
     assert pg["source_ref"] == "https://example.com/db"  # resource -> source_ref
-    assert pg["provenance"] == "imported"
+    assert pg["provenance"] == "explicit_statement"
     assert set(pg["tags"]) == {"infra", "db"}
     assert pg["created_at"] is not None
+    assert pg["updated_at"].isoformat() == "2026-06-01T09:15:00+00:00"
+    assert pg["expires_at"].isoformat() == "2026-08-01T09:15:00+00:00"
+    assert pg["ttl_seconds"] == 5_529_600
     assert "PostgreSQL 16" in pg["content"]
     assert by_title["Chose Redis"]["type"] == "decision"
 
 
+def test_okf_import_ignores_invalid_temporal_extensions(tmp_path):
+    """Malformed foreign extensions must not break an otherwise valid import."""
+    (tmp_path / "memory.md").write_text(
+        "---\n"
+        "type: fact\n"
+        "title: Durable fact\n"
+        "x_memanto:\n"
+        "  updated_at: true\n"
+        "  expires_at: true\n"
+        "  ttl_seconds: true\n"
+        "---\n\n"
+        "This memory remains importable.\n",
+        encoding="utf-8",
+    )
+
+    row = map_okf(load_okf_bundle(tmp_path))[0]
+
+    assert row["updated_at"] is not None
+    assert row["expires_at"] is None
+    assert row["ttl_seconds"] is None
+
+
+def test_okf_invalid_provenance_falls_back_to_imported():
+    """Foreign or malformed provenance must not reach batch validation."""
+    export = {
+        "memories": [
+            {
+                "title": "Foreign memory",
+                "body": "Imported from another OKF producer.",
+                "x_memanto": {"provenance": "untrusted-value"},
+            }
+        ]
+    }
+
+    assert map_okf(export)[0]["provenance"] == "imported"
+
+
 def test_foreign_okf_bundle_is_lossless(tmp_path):
-    """A foreign OKF doc: free-form ``type`` -> auto-classify (None), and the
+    """
+    A foreign OKF doc: free-form ``type`` -> auto-classify (None), and the
     type, unknown keys, and links are preserved in the footer. ``index.md`` is
-    skipped."""
+    skipped.
+    """
     tables = tmp_path / "tables"
     tables.mkdir()
     (tables / "orders.md").write_text(
@@ -192,6 +247,145 @@ def test_loader_splits_stacked_file(tmp_path):
     }
 
 
+def test_reexport_replaces_stale_bundle_entries(tmp_path):
+    """
+    A refreshed export must be an exact snapshot, not an overlay that can
+    resurrect deleted or renamed memories during a later import.
+    """
+    svc = OkfExportService(exports_dir=tmp_path / "exports")
+    first = {
+        "fact": [_mem("f1", "Old fact", "This fact was later deleted.")],
+        "event": [_mem("e1", "Old event", "This event was later deleted.")],
+    }
+    svc.write_okf_bundle("agent1", first, split="file")
+
+    second = {"fact": [_mem("f2", "Current fact", "This is still current.")]}
+    result = svc.write_okf_bundle("agent1", second, split="file")
+
+    bundle = tmp_path / "exports" / "agent1_okf"
+    assert not (bundle / "memories" / "fact" / "old-fact.md").exists()
+    assert not (bundle / "memories" / "event").exists()
+
+    imported = load_okf_bundle(result["output_path"])["memories"]
+    assert [memory["title"] for memory in imported] == ["Current fact"]
+
+
+def test_failed_reexport_preserves_last_good_bundle(tmp_path, monkeypatch):
+    """A failed final rename restores the last good bundle and cleans up."""
+    svc = OkfExportService(exports_dir=tmp_path / "exports")
+    first = {"fact": [_mem("f1", "Last good fact", "Keep this snapshot.")]}
+    result = svc.write_okf_bundle("agent1", first, split="file")
+
+    original_rename = Path.rename
+
+    def fail_staging_publish(path, target):
+        target = Path(target)
+        if path.name.startswith(".agent1_okf.tmp-") and target.name == "agent1_okf":
+            raise OSError("simulated publish failure")
+        return original_rename(path, target)
+
+    monkeypatch.setattr(Path, "rename", fail_staging_publish)
+    with pytest.raises(OSError, match="simulated publish failure"):
+        svc.write_okf_bundle(
+            "agent1",
+            {"fact": [_mem("f2", "Partial fact", "Do not publish this.")]},
+            split="file",
+        )
+
+    imported = load_okf_bundle(result["output_path"])["memories"]
+    assert [memory["title"] for memory in imported] == ["Last good fact"]
+    assert not list((tmp_path / "exports").glob(".agent1_okf.tmp-*"))
+    assert not list((tmp_path / "exports").glob(".agent1_okf.backup-*"))
+
+
+def test_loader_waits_for_bundle_replacement(tmp_path, monkeypatch):
+    """A reader cannot observe the target-to-backup replacement window."""
+    svc = OkfExportService(exports_dir=tmp_path / "exports")
+    svc.write_okf_bundle(
+        "agent1", {"fact": [_mem("f1", "Old fact", "Old snapshot.")]}, split="file"
+    )
+    bundle = tmp_path / "exports" / "agent1_okf"
+    replacement_window = Event()
+    allow_publish = Event()
+    original_rename = Path.rename
+
+    def pause_after_backup(path, target):
+        target = Path(target)
+        result = original_rename(path, target)
+        if path == bundle and target.name.startswith(".agent1_okf.backup-"):
+            replacement_window.set()
+            if not allow_publish.wait(timeout=5):
+                raise TimeoutError("test did not release the bundle publisher")
+        return result
+
+    monkeypatch.setattr(Path, "rename", pause_after_backup)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        publish = executor.submit(
+            svc.write_okf_bundle,
+            "agent1",
+            {"fact": [_mem("f2", "New fact", "New snapshot.")]},
+            None,
+            "file",
+        )
+        try:
+            assert replacement_window.wait(timeout=5)
+            read = executor.submit(load_okf_bundle, bundle)
+            with pytest.raises(FutureTimeout):
+                read.result(timeout=0.1)
+        finally:
+            allow_publish.set()
+
+        publish.result(timeout=5)
+        imported = read.result(timeout=5)["memories"]
+
+    assert [memory["title"] for memory in imported] == ["New fact"]
+    assert not list((tmp_path / "exports").glob(".agent1_okf.backup-*"))
+
+
+def test_single_file_loader_uses_bundle_lock(tmp_path, monkeypatch):
+    """An in-bundle file import waits on the bundle lock during replacement."""
+    svc = OkfExportService(exports_dir=tmp_path / "exports")
+    svc.write_okf_bundle(
+        "agent1", {"fact": [_mem("f1", "Stable slug", "Old snapshot.")]}, split="file"
+    )
+    bundle = tmp_path / "exports" / "agent1_okf"
+    entry = bundle / "memories" / "fact" / "stable-slug.md"
+    replacement_window = Event()
+    allow_publish = Event()
+    original_rename = Path.rename
+
+    def pause_after_backup(path, target):
+        target = Path(target)
+        result = original_rename(path, target)
+        if path == bundle and target.name.startswith(".agent1_okf.backup-"):
+            replacement_window.set()
+            if not allow_publish.wait(timeout=5):
+                raise TimeoutError("test did not release the bundle publisher")
+        return result
+
+    monkeypatch.setattr(Path, "rename", pause_after_backup)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        publish = executor.submit(
+            svc.write_okf_bundle,
+            "agent1",
+            {"fact": [_mem("f1", "Stable slug", "New snapshot.")]},
+            None,
+            "file",
+        )
+        try:
+            assert replacement_window.wait(timeout=5)
+            read = executor.submit(load_okf_bundle, entry)
+            with pytest.raises(FutureTimeout):
+                read.result(timeout=0.1)
+        finally:
+            allow_publish.set()
+
+        publish.result(timeout=5)
+        imported = read.result(timeout=5)["memories"]
+
+    assert [memory["body"] for memory in imported] == ["New snapshot."]
+
+
 def test_loader_extracts_multiple_links_around_malformed_markup(tmp_path):
     """Malformed candidates do not hide valid links that follow them."""
     okf_file = tmp_path / "links.md"
@@ -227,7 +421,9 @@ def test_loader_handles_many_unclosed_link_markers_quickly(tmp_path):
 
 
 def test_okf_export_splits_comma_separated_tags(tmp_path):
-    """Tags serialized by Moorcheh arrive as a comma-separated string. The
+    # Moorcheh wire format: flat ``tags`` field is a comma-joined string.
+    """
+    Tags serialized by Moorcheh arrive as a comma-separated string. The
     export must emit one frontmatter list entry per tag, not split the string
     character-by-character.
 
@@ -235,7 +431,7 @@ def test_okf_export_splits_comma_separated_tags(tmp_path):
     ``list(tags)`` wrote ["p", "r", "o", "j", "e", "c", "t", ",", "d", "b"].
     """
     svc = OkfExportService(exports_dir=tmp_path / "exports")
-    # Moorcheh wire format: flat ``tags`` field is a comma-joined string.
+
     memories_by_type = {
         "fact": [
             _mem("f1", "Postgres", "Use PG 16.", tags="project, db, prod"),
@@ -249,8 +445,10 @@ def test_okf_export_splits_comma_separated_tags(tmp_path):
 
 
 def test_okf_export_preserves_list_tags(tmp_path):
-    """Tags from the in-memory recall path arrive as a list; the export must
-    still emit a proper frontmatter list of those tags (unchanged behaviour)."""
+    """
+    Tags from the in-memory recall path arrive as a list; the export must
+    still emit a proper frontmatter list of those tags (unchanged behaviour).
+    """
     svc = OkfExportService(exports_dir=tmp_path / "exports")
     memories_by_type = {
         "fact": [

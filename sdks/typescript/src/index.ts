@@ -1,8 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { createReadStream } from "node:fs";
+import { openAsBlob } from "node:fs";
 import { stat } from "node:fs/promises";
 import { basename } from "node:path";
-import { Readable } from "node:stream";
 
 import { ServerLifecycle, type ServerOptions } from "./lifecycle.js";
 
@@ -46,6 +45,8 @@ export interface RecallInput {
   limit?: number;
   minSimilarity?: number;
   type?: string[];
+  /** Only return memories carrying all of these tags. */
+  tags?: string[];
 }
 
 export interface AnswerInput {
@@ -80,6 +81,11 @@ export interface CreateAgentInput {
   /** Agent pattern (defaults to "support" server-side). */
   pattern?: string;
   description?: string;
+}
+
+export interface DeleteAgentInput {
+  /** Also permanently delete the agent's memories in Moorcheh. */
+  deleteMemories?: boolean;
 }
 
 export interface DailySummaryInput {
@@ -140,6 +146,9 @@ export class Memanto {
   private readonly agentId: string;
   private readonly encodedAgentId: string;
   private readonly autoCreate: boolean;
+  // A server bound beyond loopback only allows agent create/activate for
+  // callers presenting its management credential (the Moorcheh API key).
+  private readonly authHeaders: Record<string, string>;
   private sessionToken: string | null = null;
   private starting: Promise<void> | null = null;
 
@@ -148,6 +157,7 @@ export class Memanto {
     this.agentId = opts.agentId;
     this.encodedAgentId = encodeURIComponent(opts.agentId);
     this.autoCreate = opts.autoCreate ?? true;
+    this.authHeaders = opts.apiKey ? { "X-Api-Key": opts.apiKey } : {};
     this.lifecycle = new ServerLifecycle(opts);
   }
 
@@ -224,6 +234,7 @@ export class Memanto {
       limit: input.limit,
       min_similarity: input.minSimilarity,
       type: input.type,
+      tags: input.tags,
     });
   }
 
@@ -325,7 +336,7 @@ export class Memanto {
     const baseUrl = this.lifecycle.baseUrl;
     const res = await fetch(`${baseUrl}/api/v2/agents`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...this.authHeaders },
       body: JSON.stringify({
         agent_id: this.agentId,
         pattern: input.pattern,
@@ -336,11 +347,17 @@ export class Memanto {
     return (await res.json()) as unknown;
   }
 
-  /** Delete the bound agent and clear any cached session for it. */
-  async deleteAgent() {
+  /**
+   * Delete the bound agent and clear any cached session for it.
+   *
+   * Its memories stay in Moorcheh unless `deleteMemories` is true. If deleting
+   * them fails, the agent is left intact and the call throws.
+   */
+  async deleteAgent(input: DeleteAgentInput = {}) {
+    const query = input.deleteMemories ? "?delete-backup-too=true" : "";
     const result = await this.request(
       "DELETE",
-      `/api/v2/agents/${this.encodedAgentId}`,
+      `/api/v2/agents/${this.encodedAgentId}${query}`,
       undefined,
       { requireSession: false },
     );
@@ -417,14 +434,16 @@ export class Memanto {
 
   private async createAgentIfMissing(): Promise<void> {
     const baseUrl = this.lifecycle.baseUrl;
-    const res = await fetch(`${baseUrl}/api/v2/agents/${this.encodedAgentId}`);
+    const res = await fetch(`${baseUrl}/api/v2/agents/${this.encodedAgentId}`, {
+      headers: this.authHeaders,
+    });
     if (res.ok) return;
     if (res.status !== 404) {
       throw await asError(res, "Failed to look up agent");
     }
     const create = await fetch(`${baseUrl}/api/v2/agents`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...this.authHeaders },
       body: JSON.stringify({ agent_id: this.agentId }),
     });
     if (!create.ok && create.status !== 409) {
@@ -436,6 +455,7 @@ export class Memanto {
     const baseUrl = this.lifecycle.baseUrl;
     const res = await fetch(`${baseUrl}/api/v2/agents/${this.encodedAgentId}/activate`, {
       method: "POST",
+      headers: this.authHeaders,
     });
     if (!res.ok) throw await asError(res, "Failed to activate agent");
     const session = (await res.json()) as SessionRecord;
@@ -472,6 +492,7 @@ export class Memanto {
     const baseUrl = this.lifecycle.baseUrl;
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
+      ...this.authHeaders,
     };
     if (requireSession) {
       headers["X-Session-Token"] = this.sessionToken ?? "";
@@ -497,44 +518,24 @@ export class Memanto {
       throw new Error(`Upload path is not a file: ${filePath}`);
     }
     const headers: Record<string, string> = {
+      ...this.authHeaders,
       "X-Session-Token": this.sessionToken ?? "",
     };
-    const send = () => {
-      const boundary = `----memanto-${randomUUID()}`;
-      const header = Buffer.from(
-        `--${boundary}\r\n` +
-          `Content-Disposition: form-data; name="file"; filename="${escapeMultipartValue(filename)}"\r\n` +
-          "Content-Type: application/octet-stream\r\n\r\n",
-      );
-      const footer = Buffer.from(`\r\n--${boundary}--\r\n`);
-      const body = Readable.from(
-        (async function* streamMultipart() {
-          yield header;
-          for await (const chunk of createReadStream(filePath)) {
-            yield chunk;
-          }
-          yield footer;
-        })(),
-      );
-      headers["Content-Type"] = `multipart/form-data; boundary=${boundary}`;
-      headers["Content-Length"] = String(
-        header.length + fileStats.size + footer.length,
-      );
+    const send = async () => {
+      const formData = new FormData();
+      const fileBlob = await openAsBlob(filePath);
+      formData.set("file", fileBlob, filename);
+
       return fetch(`${baseUrl}${path}`, {
         method: "POST",
         headers,
-        body: body as unknown as BodyInit,
-        duplex: "half",
-      } as RequestInit & { duplex: "half" });
+        body: formData,
+      });
     };
     const res = await this.sendWithSessionRetry(send, headers, true);
     if (!res.ok) throw await asError(res, `POST ${path} failed`);
     return (await res.json()) as T;
   }
-}
-
-function escapeMultipartValue(value: string): string {
-  return value.replace(/[\r\n]/g, "_").replace(/[\\"]/g, "\\$&");
 }
 
 async function asError(res: Response, prefix: string): Promise<Error> {

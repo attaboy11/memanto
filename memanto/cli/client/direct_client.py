@@ -38,11 +38,13 @@ from memanto.app.constants import (
 from memanto.app.constants import (
     ProvenanceType as MemoryProvenance,
 )
+from memanto.app.services.activity_service import log_memory_activity
 from memanto.app.utils.atomic_write import atomic_write_text
+from memanto.app.utils.client_identity import set_memanto_session
 from memanto.app.utils.errors import (
     AgentNotFoundError,
     InvalidSessionTokenError,
-    MemoryError,
+    MemoryOperationError,
     SessionError,
     SessionExpiredError,
     SessionNotFoundError,
@@ -349,6 +351,17 @@ class DirectClient:
     # Internal helpers
 
     def _get_validated_session_for_agent(self, agent_id: str):
+        """Return the active session for *agent_id*, and bind it for activity logging.
+
+        Every memory operation passes through here, which makes it the one
+        place that reliably knows both the agent and its live session id - the
+        memory services below only ever receive an agent_id.
+        """
+        session = self._resolve_validated_session(agent_id)
+        set_memanto_session(session.session_id)
+        return session
+
+    def _resolve_validated_session(self, agent_id: str):
         """
         Return the active session for *agent_id*, validating it like the FastAPI
         dependency ``get_current_session``.
@@ -390,7 +403,17 @@ class DirectClient:
         try:
             # Validate JWT token
             token_payload = session_service.validate_session(self.session_token)
-        except (SessionExpiredError, InvalidSessionTokenError):
+        except SessionExpiredError:
+            # The stored session fully lapsed (e.g. the process was idle past
+            # its expiry). With auto-recreate enabled, transparently issue a
+            # fresh session on this first operation instead of failing.
+            recreated = session_service.check_and_auto_recreate(self.session_token)
+            if recreated is None:
+                raise
+            self._cached_session = recreated
+            self.session_token = recreated.session_token
+            return recreated
+        except InvalidSessionTokenError:
             # Surface the same specific session errors as the service
             raise
 
@@ -490,26 +513,46 @@ class DirectClient:
             raise AgentNotFoundError(f"Agent '{agent_id}' not found")
         return cast(dict[str, Any], agent.model_dump(mode="json"))
 
-    def delete_agent(self, agent_id: str) -> dict[str, Any]:
+    def delete_agent(
+        self, agent_id: str, delete_memories: bool = False
+    ) -> dict[str, Any]:
         """
         Delete an agent.
 
         Args:
             agent_id: Agent identifier.
+            delete_memories: Also permanently delete the agent's memories in
+                Moorcheh (its namespace). By default they are kept and come
+                back if an agent with the same id is created again.
 
         Returns:
-            Confirmation dict with ``status`` and ``agent_id``.
+            Confirmation dict with ``status``, ``agent_id`` and
+            ``memories_deleted``.
+
+        Raises:
+            AgentNotFoundError: If the agent does not exist.
+            NamespaceError: If deleting the memories fails; the agent is then
+                left intact so the delete can be retried.
         """
         logger.debug("Deleting agent '%s'", agent_id)
         session_service = self._get_session_service()
         with session_service.lock_agent_lifecycle(agent_id):
-            self._get_agent_service().delete_agent(agent_id)
+            agent_service = self._get_agent_service()
+            if not agent_service.get_agent(agent_id):
+                raise AgentNotFoundError(f"Agent '{agent_id}' not found")
+            if delete_memories:
+                agent_service.delete_agent_memories(agent_id, self.api_key)
+            agent_service.delete_agent(agent_id)
             session_service.delete_session(agent_id)
         if self.agent_id == agent_id:
             self.session_token = None
             self.agent_id = None
             self._cached_session = None
-        return {"status": "deleted", "agent_id": agent_id}
+        return {
+            "status": "deleted",
+            "agent_id": agent_id,
+            "memories_deleted": delete_memories,
+        }
 
     # Session Management
 
@@ -649,7 +692,6 @@ class DirectClient:
         """
         # Ensure there is a valid, non-expired session for this agent
         session = self._get_validated_session_for_agent(agent_id)
-        _ = session
 
         self._validate_memory_input(memory_type, title, content, confidence)
 
@@ -683,10 +725,9 @@ class DirectClient:
 
         # Log to local session Markdown summary only after a durable write.
         if self.session_token and is_successful_write_result(result):
-            session_id = "unknown"
             self._get_session_service().try_log_memory_to_session_summary(
                 agent_id=agent_id,
-                session_id=session_id,
+                session_id=session.session_id,
                 memory_record=memory,
                 memory_id=result.get("id"),
             )
@@ -720,7 +761,7 @@ class DirectClient:
             ValueError: If batch is empty or exceeds 100 items.
         """
         # Ensure there is a valid, non-expired session for this agent
-        self._get_validated_session_for_agent(agent_id)
+        session = self._get_validated_session_for_agent(agent_id)
 
         if not memories:
             raise ValueError("Batch must contain at least one memory")
@@ -764,7 +805,11 @@ class DirectClient:
                 "source": item.get("source") or "user",
                 "provenance": provenance,
             }
-            for opt_key in ("source_ref", "created_at", "updated_at"):
+            for opt_key in (
+                "source_ref",
+                "created_at",
+                "updated_at",
+            ):
                 val = item.get(opt_key)
                 if val is not None:
                     kwargs[opt_key] = val
@@ -784,29 +829,35 @@ class DirectClient:
 
         # Log each memory to local session Markdown summary
         if self.session_token:
-            session_id = "unknown"
+            session_id = session.session_id
             session_svc = self._get_session_service()
 
             # Extract per-memory IDs from the batch result
             if not isinstance(result, dict):
-                raise MemoryError(
+                raise MemoryOperationError(
                     message="Data corruption detected: Received malformed batch result from storage layer.",
                     details={"item_preview": str(result)[:100]},
                 )
 
-            batch_results = result.get("results", [])
-            if not isinstance(batch_results, list):
-                raise MemoryError(
+            if "results" not in result:
+                raise MemoryOperationError(
+                    message="Data corruption detected: Missing 'results' in batch response from storage layer.",
+                    details={"item_preview": str(result)[:100]},
+                )
+
+            batch_results = result["results"]
+            if not isinstance(batch_results, list) or len(batch_results) != len(
+                memory_records
+            ):
+                raise MemoryOperationError(
                     message="Data corruption detected: Received malformed batch result array from storage layer.",
                     details={"item_preview": str(batch_results)[:100]},
                 )
 
             for i, mem in enumerate(memory_records):
-                item_result = batch_results[i] if i < len(batch_results) else None
-                if item_result is not None and (
-                    not isinstance(item_result, dict) or not item_result
-                ):
-                    raise MemoryError(
+                item_result = batch_results[i]
+                if not isinstance(item_result, dict) or not item_result:
+                    raise MemoryOperationError(
                         message="Data corruption detected: Received malformed batch result from storage layer.",
                         details={"item_preview": str(item_result)[:100]},
                     )
@@ -1417,6 +1468,11 @@ class DirectClient:
             footer_prompt=footer_prompt,
         )
 
+        # The RAG path calls Moorcheh directly rather than going through
+        # MemoryReadService, so it needs its own activity entry - otherwise
+        # `answer` is the one memory operation that leaves no trace.
+        log_memory_activity(op="answer", agent_id=agent_id)
+
         return {
             "agent_id": agent_id,
             "question": question,
@@ -1471,7 +1527,9 @@ class DirectClient:
             "export": export_result,
         }
 
-    def generate_conflict_report(self, agent_id: str, date: str) -> dict[str, Any]:
+    def generate_conflict_report(
+        self, agent_id: str, date: str, on_progress=None, cancel_event=None
+    ) -> dict[str, Any]:
         """
         Generate the conflict report for an agent/date.
 
@@ -1495,7 +1553,9 @@ class DirectClient:
         )
 
         service = self._get_daily_analysis_service()
-        conflict_result = service.generate_conflict_report(agent_id, date)
+        conflict_result = service.generate_conflict_report(
+            agent_id, date, on_progress=on_progress, cancel_event=cancel_event
+        )
         return {"conflicts": conflict_result}
 
     # Conflict Resolution
@@ -1518,9 +1578,9 @@ class DirectClient:
         if not date:
             date = utc_date_str()
 
-        json_path = (
-            Path.home() / ".memanto" / "conflicts" / f"{agent_id}_{date}_conflicts.json"
-        )
+        from memanto.app.config import get_conflict_report_path
+
+        json_path = get_conflict_report_path(agent_id, date)
 
         if not json_path.exists():
             return []
@@ -1578,9 +1638,9 @@ class DirectClient:
                 f"Invalid action '{action}'. Must be one of: {', '.join(sorted(valid_actions))}"
             )
 
-        json_path = (
-            Path.home() / ".memanto" / "conflicts" / f"{agent_id}_{date}_conflicts.json"
-        )
+        from memanto.app.config import get_conflict_report_path
+
+        json_path = get_conflict_report_path(agent_id, date)
         if not json_path.exists():
             raise ValueError(f"No conflict report found for {agent_id} on {date}")
 
@@ -1782,42 +1842,45 @@ class DirectClient:
         """
         Sync agent memories to a project directory's MEMORY.md.
 
-        Uses the cached export in the active backend's data directory
-        when available. Falls back to a fresh export if
-        the cache file does not exist.
+        Always runs a fresh export first, so memories written earlier in the
+        same session are included. Falls back to the previous cached export
+        when the backend is unreachable, rather than leaving the project's
+        MEMORY.md untouched or wiping it.
 
         Args:
             agent_id: Target agent.
             project_dir: Path to the project directory.
-            limit_per_type: Max memories per type for fresh export (default 25).
+            limit_per_type: Max memories per type for the export (default 25).
 
         Returns:
             Dict with ``output_path``, ``total_memories``, ``source``
-            (``"cache"`` or ``"fresh"``).
+            (``"fresh"``, or ``"stale-cache"`` if the refresh failed and a
+            previous export was reused instead).
         """
-
         validate_safe_id(agent_id, "agent_id")
         cache_path = get_data_dir() / "exports" / f"{agent_id}_memory.md"
         target_path = Path(project_dir) / "MEMORY.md"
         target_path.parent.mkdir(parents=True, exist_ok=True)
 
-        if cache_path.exists():
+        logger.debug("Refreshing memory export before syncing '%s'", agent_id)
+        try:
+            export_result = self.export_memory_md(
+                agent_id=agent_id, limit_per_type=limit_per_type
+            )
+        except ConnectionError:
+            if not cache_path.exists():
+                raise
+            # Backend unreachable, but we have a previously good export —
+            # serve that instead of wiping the project's MEMORY.md.
+            content = cache_path.read_text(encoding="utf-8")
             # Replace the project entry atomically so a repository-controlled
             # MEMORY.md symlink cannot redirect this write outside the project.
-            content = cache_path.read_text(encoding="utf-8")
             atomic_write_text(target_path, content)
-            mem_count = content.count("### ")
             return {
                 "output_path": str(target_path.resolve()),
-                "total_memories": mem_count,
-                "source": "cache",
+                "total_memories": content.count("### "),
+                "source": "stale-cache",
             }
-
-        logger.debug("Refreshing memory export before syncing '%s'", agent_id)
-        export_result = self.export_memory_md(
-            agent_id=agent_id,
-            limit_per_type=limit_per_type,
-        )
 
         exported_path = Path(export_result["output_path"])
         if exported_path.exists():
